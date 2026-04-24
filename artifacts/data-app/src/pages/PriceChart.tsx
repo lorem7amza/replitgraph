@@ -1,344 +1,523 @@
-import { useMemo, useState } from "react";
 import {
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  ReferenceLine,
-} from "recharts";
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 type Point = { t: number; price: number };
+type Range = "1D" | "1W" | "1M" | "3M" | "1Y" | "5Y";
+const RANGES: Range[] = ["1D", "1W", "1M", "3M", "1Y", "5Y"];
 
-// Reference: 5 trading days, modeled after a short-squeeze unwind.
-// Start at $385.19 (0%), peak ~ $770 (+100%), end at $237.26 (-38.40%).
-const START_PRICE = 385.19;
-const END_PRICE = 237.26;
+/* --------------------------- data generation --------------------------- */
+
+function hashString(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
 
 function seedRandom(seed: number) {
-  let s = seed >>> 0;
+  let s = seed >>> 0 || 1;
   return () => {
     s = (s * 1664525 + 1013904223) >>> 0;
     return s / 0xffffffff;
   };
 }
 
-function generateSeries(): Point[] {
-  // Trading days: Apr 16, 17, 20, 21, 22, 23 (skip weekend Apr 18-19).
-  const baseDay = new Date(2026, 3, 16, 9, 30); // Apr 16, 2026 09:30 local
-  const tradingDays: Date[] = [];
-  const dayOffsets = [0, 1, 4, 5, 6, 7]; // Thu, Fri, Mon, Tue, Wed, Thu
-  for (const off of dayOffsets) {
-    const d = new Date(baseDay);
-    d.setDate(d.getDate() + off);
-    tradingDays.push(d);
-  }
-  const pointsPerDay = 60;
-  const stepMs = (6.5 * 60_000 * 60) / pointsPerDay; // ~6.5h session
+interface RangeCfg {
+  points: number;
+  stepMs: number;
+  vol: number;
+  drift: number;
+}
 
-  // Per-day target % (relative to START_PRICE).
-  // Drives the rise then crater shape.
-  const dayTargetPct = [0, 12, 38, 78, 100, -38.4];
+const RANGE_CFG: Record<Range, RangeCfg> = {
+  "1D": { points: 78, stepMs: 5 * 60_000, vol: 0.0018, drift: 0.00005 },
+  "1W": { points: 5 * 78, stepMs: 5 * 60_000, vol: 0.0022, drift: 0.00006 },
+  "1M": { points: 22, stepMs: 24 * 3600_000, vol: 0.014, drift: 0.0009 },
+  "3M": { points: 65, stepMs: 24 * 3600_000, vol: 0.016, drift: 0.0011 },
+  "1Y": { points: 252, stepMs: 24 * 3600_000, vol: 0.018, drift: 0.0008 },
+  "5Y": { points: 260, stepMs: 7 * 24 * 3600_000, vol: 0.03, drift: 0.0025 },
+};
 
-  const rand = seedRandom(7);
+function generateSeries(ticker: string, range: Range): Point[] {
+  const cfg = RANGE_CFG[range];
+  const seed = hashString(`${ticker}|${range}`);
+  const rand = seedRandom(seed);
+
+  // Anchor a deterministic "current" price per ticker.
+  const anchor = 30 + (hashString(ticker) % 400);
+
+  // Choose a directional bias also derived from the ticker so different
+  // tickers feel different (some up, some down, some flat).
+  const biasRand = seedRandom(hashString(ticker + "_bias"));
+  const directional = (biasRand() - 0.5) * 2 * cfg.drift;
+
+  let price = anchor * (0.85 + 0.3 * biasRand());
+
   const series: Point[] = [];
-
-  for (let d = 0; d < tradingDays.length; d++) {
-    const dayStart = tradingDays[d]!;
-    const startPct = d === 0 ? 0 : dayTargetPct[d - 1]!;
-    const endPct = dayTargetPct[d]!;
-    for (let i = 0; i < pointsPerDay; i++) {
-      const u = i / (pointsPerDay - 1);
-      // Smooth interpolation with intraday noise.
-      const eased = u * u * (3 - 2 * u);
-      const pct = startPct + (endPct - startPct) * eased;
-      const noise =
-        (rand() - 0.5) * (d === tradingDays.length - 1 ? 4.5 : 2.2);
-      const finalPct = pct + noise;
-      const price = START_PRICE * (1 + finalPct / 100);
-      const t = dayStart.getTime() + i * stepMs;
-      series.push({ t, price });
-    }
+  const now = Date.now();
+  const start = now - cfg.points * cfg.stepMs;
+  for (let i = 0; i < cfg.points; i++) {
+    const z = (rand() + rand() + rand() - 1.5) * 1.4;
+    price = price * (1 + directional + cfg.vol * z);
+    series.push({ t: start + i * cfg.stepMs, price });
   }
-  // Anchor exact endpoints so the tag matches the headline.
-  series[0]!.price = START_PRICE;
-  series[series.length - 1]!.price = END_PRICE;
+  // Anchor end to the deterministic current price.
+  const last = series[series.length - 1]!;
+  const scale = anchor / last.price;
+  for (const p of series) p.price = +(p.price * scale).toFixed(4);
   return series;
 }
 
+/* ------------------------------ formatters ------------------------------ */
+
 function fmtMoney(n: number) {
   return n.toLocaleString("en-US", {
-    style: "currency",
-    currency: "USD",
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
 }
 
-function fmtMoneyPlain(n: number) {
-  return n.toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
+function fmtTimeForRange(t: number, range: Range) {
+  const d = new Date(t);
+  switch (range) {
+    case "1D":
+      return d.toLocaleTimeString("en-US", {
+        hour: "numeric",
+        minute: "2-digit",
+      });
+    case "1W":
+      return d.toLocaleDateString("en-US", { weekday: "short" });
+    case "1M":
+    case "3M":
+      return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    case "1Y":
+      return d.toLocaleDateString("en-US", { month: "short" });
+    case "5Y":
+      return String(d.getFullYear());
+  }
 }
 
-function fmtDay(t: number) {
-  return new Date(t).toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-  });
+/* ---------------------------- canvas drawing ---------------------------- */
+
+interface DrawArgs {
+  data: Point[];
+  range: Range;
+  hoverIdx: number | null;
+  width: number;
+  height: number;
 }
 
-export default function PriceChart() {
-  const data = useMemo(() => generateSeries(), []);
-  const [hover, setHover] = useState<Point | null>(null);
+function roundRectPath(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
+  const { data, range, hoverIdx, width, height } = args;
+  if (!canvas || data.length === 0 || width === 0 || height === 0) return;
+
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  if (canvas.width !== Math.round(width * dpr)) {
+    canvas.width = Math.round(width * dpr);
+  }
+  if (canvas.height !== Math.round(height * dpr)) {
+    canvas.height = Math.round(height * dpr);
+  }
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  const PAD = { top: 18, right: 76, bottom: 28, left: 8 };
+  const plotW = width - PAD.left - PAD.right;
+  const plotH = height - PAD.top - PAD.bottom;
+  if (plotW <= 0 || plotH <= 0) return;
 
   const open = data[0]!.price;
   const last = data[data.length - 1]!.price;
-  const active = hover ?? data[data.length - 1]!;
-  const activePrice = active.price;
-
-  const change = last - open;
-  const changePct = (change / open) * 100;
-  const isUp = change >= 0;
-
-  const minP = Math.min(...data.map((d) => d.price));
-  const maxP = Math.max(...data.map((d) => d.price));
-  const yMin = Math.min(open * (1 - 0.25), minP * 0.98);
-  const yMax = Math.max(maxP * 1.02, open * 2);
-
-  const upColor = "hsl(145 63% 42%)";
-  const downColor = "hsl(14 90% 53%)"; // warm orange-red
+  const isUp = last >= open;
+  const upColor = "#1f9d55";
+  const downColor = "#e8501f";
   const lineColor = isUp ? upColor : downColor;
+  const lineColorAlpha = (a: number) =>
+    `${lineColor}${Math.round(a * 255)
+      .toString(16)
+      .padStart(2, "0")}`;
 
-  // Right-axis percentage ticks: -20, 0, 20, 40, 60, 80, 100.
-  const pctTicks = useMemo(() => {
-    const pcts = [-20, 0, 20, 40, 60, 80, 100];
-    return pcts.map((p) => open * (1 + p / 100));
-  }, [open]);
+  let minP = Infinity;
+  let maxP = -Infinity;
+  for (const p of data) {
+    if (p.price < minP) minP = p.price;
+    if (p.price > maxP) maxP = p.price;
+  }
+  const span = maxP - minP || 1;
+  const yMin = Math.min(open, minP) - span * 0.08;
+  const yMax = Math.max(open, maxP) + span * 0.08;
 
-  // Day tick positions for the X axis.
-  const dayTicks = useMemo(() => {
-    const seen = new Set<string>();
-    const ticks: number[] = [];
-    for (const p of data) {
-      const key = new Date(p.t).toDateString();
-      if (!seen.has(key)) {
-        seen.add(key);
-        ticks.push(p.t);
-      }
+  const tMin = data[0]!.t;
+  const tMax = data[data.length - 1]!.t;
+  const tSpan = tMax - tMin || 1;
+
+  const xPos = (t: number) => PAD.left + ((t - tMin) / tSpan) * plotW;
+  const yPos = (price: number) =>
+    PAD.top + (1 - (price - yMin) / (yMax - yMin)) * plotH;
+
+  // Right axis percentage ticks.
+  const pcts = [-40, -20, 0, 20, 40, 60, 80, 100];
+  ctx.fillStyle = "#5a5a5a";
+  ctx.font = "11px Inter, ui-sans-serif, system-ui, sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  for (const p of pcts) {
+    const price = open * (1 + p / 100);
+    if (price < yMin || price > yMax) continue;
+    const y = yPos(price);
+    // Faint grid line (only at 0).
+    if (p === 0) {
+      ctx.strokeStyle = "#bdbdbd";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(PAD.left, y);
+      ctx.lineTo(PAD.left + plotW, y);
+      ctx.stroke();
     }
-    return ticks;
-  }, [data]);
+    ctx.fillText(`${p.toFixed(2)}%`, PAD.left + plotW + 8, y);
+  }
 
-  const activePct = ((activePrice - open) / open) * 100;
+  // Bottom date ticks.
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#5a5a5a";
+  const wantTicks = 6;
+  const seen = new Set<string>();
+  const dayTicks: number[] = [];
+  for (const p of data) {
+    const d = new Date(p.t);
+    const key =
+      range === "1D"
+        ? `${d.getHours()}`
+        : range === "5Y"
+          ? `${d.getFullYear()}-${d.getMonth()}`
+          : `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      dayTicks.push(p.t);
+    }
+  }
+  const stride = Math.max(1, Math.ceil(dayTicks.length / wantTicks));
+  const labelTicks = dayTicks.filter((_, i) => i % stride === 0);
+  for (const t of labelTicks) {
+    const x = xPos(t);
+    if (x < PAD.left || x > PAD.left + plotW) continue;
+    ctx.fillText(fmtTimeForRange(t, range), x, PAD.top + plotH + 8);
+  }
+
+  // Build line + fill paths.
+  const linePath = new Path2D();
+  for (let i = 0; i < data.length; i++) {
+    const x = xPos(data[i]!.t);
+    const y = yPos(data[i]!.price);
+    if (i === 0) linePath.moveTo(x, y);
+    else linePath.lineTo(x, y);
+  }
+  const fillPath = new Path2D(linePath);
+  fillPath.lineTo(xPos(tMax), PAD.top + plotH);
+  fillPath.lineTo(xPos(tMin), PAD.top + plotH);
+  fillPath.closePath();
+
+  const grad = ctx.createLinearGradient(0, PAD.top, 0, PAD.top + plotH);
+  grad.addColorStop(0, lineColorAlpha(0.22));
+  grad.addColorStop(1, lineColorAlpha(0));
+  ctx.fillStyle = grad;
+  ctx.fill(fillPath);
+
+  ctx.strokeStyle = lineColor;
+  ctx.lineWidth = 1.75;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.stroke(linePath);
+
+  // Active point (hover or last).
+  const activeIdx =
+    hoverIdx !== null && hoverIdx >= 0 && hoverIdx < data.length
+      ? hoverIdx
+      : data.length - 1;
+  const active = data[activeIdx]!;
+  const ax = xPos(active.t);
+  const ay = yPos(active.price);
+
+  // Crosshair (only when hovering).
+  if (hoverIdx !== null) {
+    ctx.strokeStyle = "#9a9a9a";
+    ctx.setLineDash([2, 3]);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(ax, PAD.top);
+    ctx.lineTo(ax, PAD.top + plotH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Horizontal callout line at active price.
+  ctx.strokeStyle = lineColor;
+  ctx.setLineDash([3, 3]);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(PAD.left, ay);
+  ctx.lineTo(PAD.left + plotW, ay);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Active dot.
+  ctx.beginPath();
+  ctx.fillStyle = "#ffffff";
+  ctx.strokeStyle = lineColor;
+  ctx.lineWidth = 2;
+  ctx.arc(ax, ay, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  // Callout tag.
+  const pct = ((active.price - open) / open) * 100;
+  const tagW = 70;
+  const tagH = 22;
+  const tagX = PAD.left + plotW + 6;
+  const tagY = Math.min(
+    Math.max(ay - tagH / 2, PAD.top),
+    PAD.top + plotH - tagH,
+  );
+  roundRectPath(ctx, tagX, tagY, tagW, tagH, 4);
+  ctx.fillStyle = lineColor;
+  ctx.fill();
+  ctx.fillStyle = "#ffffff";
+  ctx.font =
+    "600 11px Inter, ui-sans-serif, system-ui, -apple-system, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(
+    `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`,
+    tagX + tagW / 2,
+    tagY + tagH / 2 + 1,
+  );
+}
+
+/* -------------------------------- page -------------------------------- */
+
+export default function PriceChart() {
+  const [ticker, setTicker] = useState("AAPL");
+  const [headline, setHeadline] = useState(
+    "Apple Stock Climbs After Strong Quarter",
+  );
+  const [range, setRange] = useState<Range>("3M");
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+
+  const data = useMemo(() => generateSeries(ticker, range), [ticker, range]);
+  const open = data[0]!.price;
+  const last = data[data.length - 1]!.price;
+  const active =
+    hoverIdx !== null && hoverIdx >= 0 && hoverIdx < data.length
+      ? data[hoverIdx]!
+      : data[data.length - 1]!;
+  const change = active.price - open;
+  const changePct = (change / open) * 100;
+  const isUp = last >= open;
+  const lineColor = isUp ? "#1f9d55" : "#e8501f";
+
+  /* canvas + resize */
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [size, setSize] = useState({ w: 0, h: 320 });
+
+  useLayoutEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        setSize({ w: width, h: height });
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    drawChart(canvasRef.current, {
+      data,
+      range,
+      hoverIdx,
+      width: size.w,
+      height: size.h,
+    });
+  }, [data, range, hoverIdx, size]);
+
+  /* mouse handling */
+  const handlePointer = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const PAD_LEFT = 8;
+      const PAD_RIGHT = 76;
+      const plotW = rect.width - PAD_LEFT - PAD_RIGHT;
+      if (plotW <= 0) return;
+      const u = Math.max(0, Math.min(1, (x - PAD_LEFT) / plotW));
+      const idx = Math.round(u * (data.length - 1));
+      setHoverIdx(idx);
+    },
+    [data.length],
+  );
+
+  const handleLeave = useCallback(() => setHoverIdx(null), []);
+
+  /* ticker input */
+  const handleTickerChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const next = e.target.value
+      .toUpperCase()
+      .replace(/[^A-Z.\-]/g, "")
+      .slice(0, 6);
+    setTicker(next || "AAPL");
+  };
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <div className="mx-auto max-w-[760px] px-6 py-12">
-        {/* Editorial headline */}
-        <h1
-          className="text-center font-serif text-[44px] leading-[1.05] tracking-tight text-foreground sm:text-[56px]"
-          style={{ fontFamily: 'Georgia, "Times New Roman", serif' }}
-        >
-          Apple Stock Craters
-          <br />
-          After Historic
-          <br />
-          Squeeze Unwinds
-        </h1>
-
-        {/* Card */}
-        <div
-          className="mt-10 rounded-[28px] p-6 sm:p-7"
-          style={{ backgroundColor: "hsl(0 0% 94%)" }}
-        >
-          {/* Card header */}
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <div className="text-[34px] font-semibold tabular-nums tracking-tight text-foreground sm:text-[40px]">
-                ${fmtMoneyPlain(activePrice)}
-              </div>
-              <div className="mt-1 flex items-center gap-2 text-[13px] sm:text-sm">
-                <span
-                  className="font-semibold tabular-nums"
-                  style={{ color: downColor }}
-                >
-                  {(activePrice - open >= 0 ? "+" : "-") +
-                    fmtMoneyPlain(Math.abs(activePrice - open))}{" "}
-                  ({activePct >= 0 ? "+" : ""}
-                  {activePct.toFixed(2)}%)
-                </span>
-                <span className="text-muted-foreground">|</span>
-                <span className="text-muted-foreground">5 Day</span>
-              </div>
-            </div>
-
-            {/* AAPL logo tile */}
-            <div
-              className="flex h-[68px] w-[68px] shrink-0 items-center justify-center rounded-[18px] bg-white shadow-sm"
-              aria-label="AAPL"
-            >
-              <svg
-                width="36"
-                height="36"
-                viewBox="0 0 24 24"
-                fill="hsl(0 0% 8%)"
-                aria-hidden="true"
-              >
-                <path d="M16.365 1.43c0 1.14-.493 2.27-1.177 3.08-.744.9-1.99 1.57-2.987 1.57-.12 0-.23-.02-.3-.03-.01-.06-.04-.22-.04-.39 0-1.15.572-2.27 1.206-2.98.804-.94 2.142-1.64 3.248-1.68.03.13.05.28.05.43zM20.5 17.36c-.55 1.27-.81 1.84-1.52 2.96-.99 1.56-2.39 3.5-4.12 3.51-1.54.02-1.93-1.01-4.02-1-2.09.01-2.52 1.02-4.06 1-1.73-.02-3.05-1.77-4.04-3.33C.86 17.93 0 14.5.99 12.32c.85-1.85 2.47-3.02 4.18-3.02 1.74 0 2.83.95 4.27.95 1.39 0 2.24-.95 4.25-.95 1.52 0 3.13.83 4.28 2.27-3.76 2.06-3.15 7.41-1.47 5.79z" />
-              </svg>
-            </div>
-          </div>
-
-          {/* Chart */}
-          <div className="mt-6 h-[320px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart
-                data={data}
-                margin={{ top: 18, right: 76, left: 0, bottom: 24 }}
-                onMouseMove={(e: {
-                  activePayload?: Array<{ payload: Point }>;
-                }) => {
-                  if (e?.activePayload?.[0])
-                    setHover(e.activePayload[0].payload);
-                }}
-                onMouseLeave={() => setHover(null)}
-              >
-                <defs>
-                  <linearGradient id="rh-fill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={lineColor} stopOpacity={0.18} />
-                    <stop offset="100%" stopColor={lineColor} stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-
-                <XAxis
-                  dataKey="t"
-                  type="number"
-                  domain={["dataMin", "dataMax"]}
-                  ticks={dayTicks}
-                  tickFormatter={fmtDay}
-                  tickLine={false}
-                  axisLine={false}
-                  tick={{
-                    fill: "hsl(0 0% 35%)",
-                    fontSize: 11,
-                  }}
-                  dy={6}
-                  interval={0}
-                />
-
-                <YAxis
-                  yAxisId="price"
-                  orientation="left"
-                  domain={[yMin, yMax]}
-                  hide
-                />
-
-                <YAxis
-                  yAxisId="pct"
-                  orientation="right"
-                  domain={[yMin, yMax]}
-                  ticks={pctTicks}
-                  tickLine={false}
-                  axisLine={false}
-                  width={68}
-                  tick={{ fill: "hsl(0 0% 35%)", fontSize: 11 }}
-                  tickFormatter={(v: number) => {
-                    const pct = ((v - open) / open) * 100;
-                    return `${pct.toFixed(2)}%`;
-                  }}
-                />
-
-                <ReferenceLine
-                  yAxisId="price"
-                  y={open}
-                  stroke="hsl(0 0% 70%)"
-                  strokeDasharray="0"
-                  strokeOpacity={0.6}
-                />
-
-                <Tooltip
-                  cursor={{
-                    stroke: "hsl(0 0% 50%)",
-                    strokeWidth: 1,
-                    strokeDasharray: "2 3",
-                  }}
-                  content={() => null}
-                />
-
-                <Area
-                  yAxisId="price"
-                  type="monotone"
-                  dataKey="price"
-                  stroke={lineColor}
-                  strokeWidth={1.75}
-                  fill="url(#rh-fill)"
-                  dot={false}
-                  activeDot={{
-                    r: 4,
-                    stroke: lineColor,
-                    strokeWidth: 2,
-                    fill: "hsl(0 0% 100%)",
-                  }}
-                  isAnimationActive={false}
-                />
-
-                {/* Dashed callout line + percentage tag */}
-                <ReferenceLine
-                  yAxisId="price"
-                  y={activePrice}
-                  stroke={lineColor}
-                  strokeDasharray="3 3"
-                  strokeOpacity={0.85}
-                  label={({
-                    viewBox,
-                  }: {
-                    viewBox?: { x?: number; y?: number; width?: number };
-                  }) => {
-                    if (!viewBox) return null as unknown as React.ReactElement;
-                    const x = (viewBox.x ?? 0) + (viewBox.width ?? 0);
-                    const y = viewBox.y ?? 0;
-                    const w = 70;
-                    const h = 22;
-                    const sign = activePct >= 0 ? "+" : "";
-                    return (
-                      <g transform={`translate(${x + 6}, ${y - h / 2})`}>
-                        <rect
-                          width={w}
-                          height={h}
-                          rx={4}
-                          ry={4}
-                          fill={lineColor}
-                        />
-                        <text
-                          x={w / 2}
-                          y={h / 2 + 4}
-                          textAnchor="middle"
-                          fontSize={11}
-                          fontWeight={700}
-                          fill="hsl(0 0% 100%)"
-                        >
-                          {sign}
-                          {activePct.toFixed(2)}%
-                        </text>
-                      </g>
-                    );
-                  }}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
+      <div className="mx-auto max-w-[820px] px-6 py-12">
+        {/* Editable headline */}
+        <div className="text-center">
+          <textarea
+            value={headline}
+            onChange={(e) => setHeadline(e.target.value)}
+            spellCheck={false}
+            rows={3}
+            className="w-full resize-none border-none bg-transparent text-center text-[40px] leading-[1.05] tracking-tight text-foreground outline-none focus:bg-[hsl(0_0%_97%)] sm:text-[52px]"
+            style={{
+              fontFamily: 'Georgia, "Times New Roman", serif',
+              fontWeight: 500,
+            }}
+            aria-label="Editable headline"
+          />
+          <div className="mt-1 text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+            Click headline or ticker to edit
           </div>
         </div>
 
-        {/* Subtle context line */}
-        <div className="mt-6 text-center text-xs text-muted-foreground">
-          {fmtDay(data[0]!.t)} – {fmtDay(data[data.length - 1]!.t)} ·{" "}
-          Open {fmtMoney(open)} · Last {fmtMoney(last)} · Change{" "}
-          <span style={{ color: downColor }} className="font-semibold">
-            {changePct.toFixed(2)}%
-          </span>
+        {/* Card */}
+        <div
+          className="mt-8 rounded-[28px] p-6 sm:p-7"
+          style={{ backgroundColor: "hsl(0 0% 94%)" }}
+        >
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              {/* Ticker input */}
+              <input
+                value={ticker}
+                onChange={handleTickerChange}
+                spellCheck={false}
+                className="w-[110px] border-none bg-transparent text-[12px] font-semibold uppercase tracking-[0.18em] text-muted-foreground outline-none focus:text-foreground"
+                aria-label="Ticker symbol"
+              />
+              <div className="mt-1 text-[34px] font-semibold tabular-nums tracking-tight text-foreground sm:text-[40px]">
+                ${fmtMoney(active.price)}
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-[13px] sm:text-sm">
+                <span
+                  className="font-semibold tabular-nums"
+                  style={{ color: lineColor }}
+                >
+                  {change >= 0 ? "+" : "-"}
+                  {fmtMoney(Math.abs(change))} ({changePct >= 0 ? "+" : ""}
+                  {changePct.toFixed(2)}%)
+                </span>
+                <span className="text-muted-foreground">|</span>
+                <span className="text-muted-foreground">{range}</span>
+              </div>
+            </div>
+
+            {/* Logo tile */}
+            <div
+              className="flex h-[68px] w-[68px] shrink-0 items-center justify-center rounded-[18px] bg-white text-[20px] font-bold tracking-tight shadow-sm"
+              style={{ color: lineColor }}
+              aria-label={`${ticker} logo`}
+            >
+              {ticker.slice(0, 4)}
+            </div>
+          </div>
+
+          {/* Canvas chart */}
+          <div ref={wrapRef} className="relative mt-6 h-[320px] w-full">
+            <canvas
+              ref={canvasRef}
+              onPointerMove={handlePointer}
+              onPointerDown={handlePointer}
+              onPointerLeave={handleLeave}
+              className="block h-full w-full touch-none cursor-crosshair"
+            />
+          </div>
+
+          {/* Range selector */}
+          <div className="mt-4 flex flex-wrap items-center gap-1">
+            {RANGES.map((r) => {
+              const isActive = r === range;
+              return (
+                <button
+                  key={r}
+                  type="button"
+                  onClick={() => {
+                    setRange(r);
+                    setHoverIdx(null);
+                  }}
+                  className="rounded-md px-3 py-1.5 text-xs font-semibold transition-colors"
+                  style={{
+                    color: isActive ? "#ffffff" : "hsl(0 0% 35%)",
+                    backgroundColor: isActive ? lineColor : "transparent",
+                  }}
+                >
+                  {r}
+                </button>
+              );
+            })}
+            <div className="ml-auto text-xs tabular-nums text-muted-foreground">
+              {new Date(active.t).toLocaleString("en-US", {
+                month: "short",
+                day: "numeric",
+                hour:
+                  range === "1D" || range === "1W" ? "numeric" : undefined,
+                minute:
+                  range === "1D" || range === "1W" ? "2-digit" : undefined,
+                year:
+                  range === "1Y" || range === "5Y" ? "numeric" : undefined,
+              })}
+            </div>
+          </div>
         </div>
       </div>
     </div>
