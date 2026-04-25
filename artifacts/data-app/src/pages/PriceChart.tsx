@@ -142,7 +142,7 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
 
-  const PAD = { top: 18, right: 80, bottom: 28, left: 8 };
+  const PAD = { top: 18, right: 80, bottom: 8, left: 8 };
   const plotW = width - PAD.left - PAD.right;
   const plotH = height - PAD.top - PAD.bottom;
   if (plotW <= 0 || plotH <= 0) return;
@@ -186,14 +186,6 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
     for (const p of ticks) {
       const price = baseline * (1 + p / 100);
       const y = yPos(price);
-      if (Math.abs(p) < 1e-6) {
-        ctx.strokeStyle = "#bdbdbd";
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(PAD.left, y);
-        ctx.lineTo(PAD.left + plotW, y);
-        ctx.stroke();
-      }
       ctx.fillText(`${p >= 0 ? "+" : ""}${p.toFixed(2)}%`, PAD.left + plotW + 8, y);
     }
   } else {
@@ -202,44 +194,6 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
       const y = yPos(v);
       ctx.fillText(fmtMoney(v), PAD.left + plotW + 8, y);
     }
-    // baseline (previous close) reference line
-    if (baseline >= yMin && baseline <= yMax) {
-      const yb = yPos(baseline);
-      ctx.strokeStyle = "#bdbdbd";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(PAD.left, yb);
-      ctx.lineTo(PAD.left + plotW, yb);
-      ctx.stroke();
-    }
-  }
-
-  // Bottom date ticks.
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-  ctx.fillStyle = "#5a5a5a";
-  const wantTicks = 6;
-  const seen = new Set<string>();
-  const dayTicks: number[] = [];
-  for (const p of data) {
-    const d = new Date(p.t);
-    const key =
-      period === "1d"
-        ? `${d.getHours()}`
-        : period === "max" || period === "5y"
-          ? `${d.getFullYear()}`
-          : `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      dayTicks.push(p.t);
-    }
-  }
-  const stride = Math.max(1, Math.ceil(dayTicks.length / wantTicks));
-  const labelTicks = dayTicks.filter((_, i) => i % stride === 0);
-  for (const t of labelTicks) {
-    const x = xPos(t);
-    if (x < PAD.left || x > PAD.left + plotW) continue;
-    ctx.fillText(fmtTickLabel(t, period, interval), x, PAD.top + plotH + 8);
   }
 
   // Line + fill.
@@ -625,23 +579,6 @@ export default function PriceChart() {
               )}
             </div>
 
-            <div className="mt-3 flex items-center justify-between text-xs tabular-nums text-muted-foreground">
-              <span>
-                {quote ? `${quote.symbol} · ${quote.currency}` : ""}
-              </span>
-              <span>
-                {data.length > 0
-                  ? new Date(active.t).toLocaleString("en-US", {
-                      month: "short",
-                      day: "numeric",
-                      year: timeframe.period === "max" || timeframe.period === "5y" || timeframe.period === "1y"
-                        ? "numeric" : undefined,
-                      hour: ["1d", "5d"].includes(timeframe.period) ? "numeric" : undefined,
-                      minute: ["1d", "5d"].includes(timeframe.period) ? "2-digit" : undefined,
-                    })
-                  : ""}
-              </span>
-            </div>
           </div>
         </main>
       </div>
