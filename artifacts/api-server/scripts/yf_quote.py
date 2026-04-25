@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Fetch a price series from Yahoo Finance via yfinance and print JSON.
 
-Usage: yf_quote.py <TICKER> <RANGE>
-where RANGE is one of: 1D, 1W, 1M, 3M, 1Y, 5Y
+Usage: yf_quote.py <TICKER> <PERIOD> <INTERVAL>
 """
 import json
 import math
@@ -10,13 +9,12 @@ import sys
 
 import yfinance as yf
 
-RANGE_MAP = {
-    "1D": ("1d", "5m"),
-    "1W": ("5d", "15m"),
-    "1M": ("1mo", "1d"),
-    "3M": ("3mo", "1d"),
-    "1Y": ("1y", "1d"),
-    "5Y": ("5y", "1wk"),
+VALID_PERIODS = {
+    "1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max",
+}
+VALID_INTERVALS = {
+    "1m", "2m", "5m", "15m", "30m", "60m", "90m",
+    "1h", "1d", "5d", "1wk", "1mo", "3mo",
 }
 
 
@@ -27,18 +25,19 @@ def fail(msg: str, code: int = 1) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
-        fail("usage: yf_quote.py <TICKER> <RANGE>")
+    if len(sys.argv) != 4:
+        fail("usage: yf_quote.py <TICKER> <PERIOD> <INTERVAL>")
 
     ticker_raw = sys.argv[1].strip().upper()
-    range_key = sys.argv[2].strip().upper()
+    period = sys.argv[2].strip().lower()
+    interval = sys.argv[3].strip().lower()
 
     if not ticker_raw:
         fail("ticker is required")
-    if range_key not in RANGE_MAP:
-        fail(f"invalid range: {range_key}")
-
-    period, interval = RANGE_MAP[range_key]
+    if period not in VALID_PERIODS:
+        fail(f"invalid period: {period}")
+    if interval not in VALID_INTERVALS:
+        fail(f"invalid interval: {interval}")
 
     try:
         t = yf.Ticker(ticker_raw)
@@ -48,7 +47,7 @@ def main() -> None:
         return
 
     if hist is None or hist.empty:
-        fail(f"no data for {ticker_raw}")
+        fail(f"no data for {ticker_raw} ({period}/{interval})")
         return
 
     points = []
@@ -72,29 +71,25 @@ def main() -> None:
         info = {}
 
     last = points[-1]["price"]
-    previous_close = info.get("previous_close") if isinstance(info, dict) else None
-    if previous_close is None:
-        try:
-            previous_close = float(info["previousClose"])  # type: ignore[index]
-        except Exception:  # noqa: BLE001
-            previous_close = points[0]["price"]
+    previous_close = None
+    if isinstance(info, dict):
+        previous_close = info.get("previous_close") or info.get("previousClose")
+    try:
+        previous_close = float(previous_close) if previous_close is not None else points[0]["price"]
+    except Exception:  # noqa: BLE001
+        previous_close = points[0]["price"]
 
     currency = None
     long_name = None
-    try:
-        currency = info.get("currency") if isinstance(info, dict) else None
-    except Exception:  # noqa: BLE001
-        currency = None
-    try:
-        long_name = info.get("longName") if isinstance(info, dict) else None
-    except Exception:  # noqa: BLE001
-        long_name = None
+    if isinstance(info, dict):
+        currency = info.get("currency")
+        long_name = info.get("longName") or info.get("long_name")
 
     out = {
         "symbol": ticker_raw,
         "name": long_name or ticker_raw,
         "currency": currency or "USD",
-        "range": range_key,
+        "period": period,
         "interval": interval,
         "last": last,
         "previousClose": float(previous_close),

@@ -8,19 +8,54 @@ import {
 } from "react";
 
 type Point = { t: number; price: number };
-type Range = "1D" | "1W" | "1M" | "3M" | "1Y" | "5Y";
-const RANGES: Range[] = ["1D", "1W", "1M", "3M", "1Y", "5Y"];
+type DisplayMode = "price" | "percent";
 
 interface QuoteResponse {
   symbol: string;
   name: string;
   currency: string;
-  range: Range;
+  period: string;
   interval: string;
   last: number;
   previousClose: number;
   points: Point[];
 }
+
+/* ------------------------------ timeframes ------------------------------ */
+
+interface Timeframe {
+  key: string;
+  label: string;
+  period: string;
+  defaultInterval: string;
+  allowedIntervals: string[];
+}
+
+const TIMEFRAMES: Timeframe[] = [
+  { key: "1D", label: "1D", period: "1d", defaultInterval: "5m",
+    allowedIntervals: ["1m", "2m", "5m", "15m", "30m", "1h"] },
+  { key: "5D", label: "5D", period: "5d", defaultInterval: "15m",
+    allowedIntervals: ["5m", "15m", "30m", "1h", "1d"] },
+  { key: "1M", label: "1M", period: "1mo", defaultInterval: "1d",
+    allowedIntervals: ["30m", "1h", "1d"] },
+  { key: "3M", label: "3M", period: "3mo", defaultInterval: "1d",
+    allowedIntervals: ["1h", "1d", "5d", "1wk"] },
+  { key: "6M", label: "6M", period: "6mo", defaultInterval: "1d",
+    allowedIntervals: ["1d", "5d", "1wk"] },
+  { key: "YTD", label: "YTD", period: "ytd", defaultInterval: "1d",
+    allowedIntervals: ["1d", "5d", "1wk", "1mo"] },
+  { key: "1Y", label: "1Y", period: "1y", defaultInterval: "1d",
+    allowedIntervals: ["1d", "5d", "1wk", "1mo"] },
+  { key: "5Y", label: "5Y", period: "5y", defaultInterval: "1wk",
+    allowedIntervals: ["1d", "1wk", "1mo", "3mo"] },
+  { key: "MAX", label: "MAX", period: "max", defaultInterval: "1mo",
+    allowedIntervals: ["1wk", "1mo", "3mo"] },
+];
+
+const INTERVAL_LABELS: Record<string, string> = {
+  "1m": "1m", "2m": "2m", "5m": "5m", "15m": "15m", "30m": "30m",
+  "1h": "1H", "1d": "1D", "5d": "5D", "1wk": "1W", "1mo": "1M", "3mo": "3M",
+};
 
 /* ------------------------------ formatters ------------------------------ */
 
@@ -31,44 +66,36 @@ function fmtMoney(n: number) {
   });
 }
 
-function fmtTimeForRange(t: number, range: Range) {
+function fmtTickLabel(t: number, period: string, interval: string) {
   const d = new Date(t);
-  switch (range) {
-    case "1D":
-      return d.toLocaleTimeString("en-US", {
-        hour: "numeric",
-        minute: "2-digit",
-      });
-    case "1W":
-      return d.toLocaleDateString("en-US", { weekday: "short" });
-    case "1M":
-    case "3M":
-      return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-    case "1Y":
-      return d.toLocaleDateString("en-US", { month: "short" });
-    case "5Y":
-      return String(d.getFullYear());
+  const intraday = ["1m", "2m", "5m", "15m", "30m", "1h"].includes(interval);
+  if (period === "1d" || (period === "5d" && intraday)) {
+    return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
   }
+  if (period === "5d") return d.toLocaleDateString("en-US", { weekday: "short" });
+  if (period === "1mo" || period === "3mo" || period === "6mo" || period === "ytd") {
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  }
+  if (period === "1y") return d.toLocaleDateString("en-US", { month: "short" });
+  return String(d.getFullYear());
 }
 
 /* ---------------------------- canvas drawing ---------------------------- */
 
 interface DrawArgs {
   data: Point[];
-  range: Range;
   hoverIdx: number | null;
   width: number;
   height: number;
-  baseline: number; // open / previous close used for % computation
+  baseline: number;
+  period: string;
+  interval: string;
+  display: DisplayMode;
 }
 
 function roundRectPath(
   ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  r: number,
+  x: number, y: number, w: number, h: number, r: number,
 ) {
   ctx.beginPath();
   ctx.moveTo(x + r, y);
@@ -83,17 +110,30 @@ function roundRectPath(
   ctx.closePath();
 }
 
+function niceTicks(min: number, max: number, count = 5): number[] {
+  if (min === max) return [min];
+  const range = max - min;
+  const rough = range / (count - 1);
+  const pow = Math.pow(10, Math.floor(Math.log10(rough)));
+  const norm = rough / pow;
+  let step: number;
+  if (norm < 1.5) step = 1 * pow;
+  else if (norm < 3) step = 2 * pow;
+  else if (norm < 7) step = 5 * pow;
+  else step = 10 * pow;
+  const start = Math.ceil(min / step) * step;
+  const out: number[] = [];
+  for (let v = start; v <= max + 1e-9; v += step) out.push(Number(v.toFixed(10)));
+  return out;
+}
+
 function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
-  const { data, range, hoverIdx, width, height, baseline } = args;
+  const { data, hoverIdx, width, height, baseline, period, interval, display } = args;
   if (!canvas || data.length === 0 || width === 0 || height === 0) return;
 
   const dpr = Math.max(1, window.devicePixelRatio || 1);
-  if (canvas.width !== Math.round(width * dpr)) {
-    canvas.width = Math.round(width * dpr);
-  }
-  if (canvas.height !== Math.round(height * dpr)) {
-    canvas.height = Math.round(height * dpr);
-  }
+  if (canvas.width !== Math.round(width * dpr)) canvas.width = Math.round(width * dpr);
+  if (canvas.height !== Math.round(height * dpr)) canvas.height = Math.round(height * dpr);
   canvas.style.width = `${width}px`;
   canvas.style.height = `${height}px`;
 
@@ -102,7 +142,7 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
 
-  const PAD = { top: 18, right: 76, bottom: 28, left: 8 };
+  const PAD = { top: 18, right: 80, bottom: 28, left: 8 };
   const plotW = width - PAD.left - PAD.right;
   const plotH = height - PAD.top - PAD.bottom;
   if (plotW <= 0 || plotH <= 0) return;
@@ -113,9 +153,7 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   const downColor = "#e8501f";
   const lineColor = isUp ? upColor : downColor;
   const lineColorAlpha = (a: number) =>
-    `${lineColor}${Math.round(a * 255)
-      .toString(16)
-      .padStart(2, "0")}`;
+    `${lineColor}${Math.round(a * 255).toString(16).padStart(2, "0")}`;
 
   let minP = Infinity;
   let maxP = -Infinity;
@@ -123,7 +161,7 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
     if (p.price < minP) minP = p.price;
     if (p.price > maxP) maxP = p.price;
   }
-  const span = maxP - minP || 1;
+  const span = maxP - minP || Math.abs(maxP) * 0.01 || 1;
   const yMin = Math.min(baseline, minP) - span * 0.08;
   const yMax = Math.max(baseline, maxP) + span * 0.08;
 
@@ -135,25 +173,45 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   const yPos = (price: number) =>
     PAD.top + (1 - (price - yMin) / (yMax - yMin)) * plotH;
 
-  // Right axis percentage ticks (relative to baseline).
-  const candidatePcts = [-40, -20, -10, 0, 10, 20, 40, 60, 80, 100];
+  // Right axis labels.
   ctx.fillStyle = "#5a5a5a";
   ctx.font = "11px Inter, ui-sans-serif, system-ui, sans-serif";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
-  for (const p of candidatePcts) {
-    const price = baseline * (1 + p / 100);
-    if (price < yMin || price > yMax) continue;
-    const y = yPos(price);
-    if (p === 0) {
+
+  if (display === "percent") {
+    const minPct = ((yMin - baseline) / baseline) * 100;
+    const maxPct = ((yMax - baseline) / baseline) * 100;
+    const ticks = niceTicks(minPct, maxPct, 6);
+    for (const p of ticks) {
+      const price = baseline * (1 + p / 100);
+      const y = yPos(price);
+      if (Math.abs(p) < 1e-6) {
+        ctx.strokeStyle = "#bdbdbd";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(PAD.left, y);
+        ctx.lineTo(PAD.left + plotW, y);
+        ctx.stroke();
+      }
+      ctx.fillText(`${p >= 0 ? "+" : ""}${p.toFixed(2)}%`, PAD.left + plotW + 8, y);
+    }
+  } else {
+    const ticks = niceTicks(yMin, yMax, 6);
+    for (const v of ticks) {
+      const y = yPos(v);
+      ctx.fillText(fmtMoney(v), PAD.left + plotW + 8, y);
+    }
+    // baseline (previous close) reference line
+    if (baseline >= yMin && baseline <= yMax) {
+      const yb = yPos(baseline);
       ctx.strokeStyle = "#bdbdbd";
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(PAD.left, y);
-      ctx.lineTo(PAD.left + plotW, y);
+      ctx.moveTo(PAD.left, yb);
+      ctx.lineTo(PAD.left + plotW, yb);
       ctx.stroke();
     }
-    ctx.fillText(`${p.toFixed(2)}%`, PAD.left + plotW + 8, y);
   }
 
   // Bottom date ticks.
@@ -166,10 +224,10 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   for (const p of data) {
     const d = new Date(p.t);
     const key =
-      range === "1D"
+      period === "1d"
         ? `${d.getHours()}`
-        : range === "5Y"
-          ? `${d.getFullYear()}-${d.getMonth()}`
+        : period === "max" || period === "5y"
+          ? `${d.getFullYear()}`
           : `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
     if (!seen.has(key)) {
       seen.add(key);
@@ -181,10 +239,10 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   for (const t of labelTicks) {
     const x = xPos(t);
     if (x < PAD.left || x > PAD.left + plotW) continue;
-    ctx.fillText(fmtTimeForRange(t, range), x, PAD.top + plotH + 8);
+    ctx.fillText(fmtTickLabel(t, period, interval), x, PAD.top + plotH + 8);
   }
 
-  // Build line + fill paths.
+  // Line + fill.
   const linePath = new Path2D();
   for (let i = 0; i < data.length; i++) {
     const x = xPos(data[i]!.t);
@@ -246,27 +304,24 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   ctx.fill();
   ctx.stroke();
 
+  // Active value tag (price or %).
   const pct = ((active.price - baseline) / baseline) * 100;
-  const tagW = 70;
+  const tagText =
+    display === "percent"
+      ? `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`
+      : fmtMoney(active.price);
+  ctx.font = "600 11px Inter, ui-sans-serif, system-ui, -apple-system, sans-serif";
+  const tagW = Math.max(56, ctx.measureText(tagText).width + 16);
   const tagH = 22;
   const tagX = PAD.left + plotW + 6;
-  const tagY = Math.min(
-    Math.max(ay - tagH / 2, PAD.top),
-    PAD.top + plotH - tagH,
-  );
+  const tagY = Math.min(Math.max(ay - tagH / 2, PAD.top), PAD.top + plotH - tagH);
   roundRectPath(ctx, tagX, tagY, tagW, tagH, 4);
   ctx.fillStyle = lineColor;
   ctx.fill();
   ctx.fillStyle = "#ffffff";
-  ctx.font =
-    "600 11px Inter, ui-sans-serif, system-ui, -apple-system, sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(
-    `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`,
-    tagX + tagW / 2,
-    tagY + tagH / 2 + 1,
-  );
+  ctx.fillText(tagText, tagX + tagW / 2, tagY + tagH / 2 + 1);
 }
 
 /* -------------------------------- page -------------------------------- */
@@ -279,14 +334,28 @@ export default function PriceChart() {
   const [headline, setHeadline] = useState(
     "Apple Stock Climbs After Strong Quarter",
   );
-  const [range, setRange] = useState<Range>("3M");
+  const [timeframeKey, setTimeframeKey] = useState("3M");
+  const [interval, setIntervalState] = useState("1d");
+  const [display, setDisplay] = useState<DisplayMode>("price");
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
   const [quote, setQuote] = useState<QuoteResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Fetch from Yahoo Finance via the API server.
+  const timeframe = useMemo(
+    () => TIMEFRAMES.find((t) => t.key === timeframeKey) ?? TIMEFRAMES[3]!,
+    [timeframeKey],
+  );
+
+  // Auto-correct interval when timeframe changes if current interval not allowed.
+  useEffect(() => {
+    if (!timeframe.allowedIntervals.includes(interval)) {
+      setIntervalState(timeframe.defaultInterval);
+    }
+  }, [timeframe, interval]);
+
+  // Fetch.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -294,7 +363,7 @@ export default function PriceChart() {
     setHoverIdx(null);
     const url = `${apiBase}/quote?ticker=${encodeURIComponent(
       ticker,
-    )}&range=${range}`;
+    )}&period=${timeframe.period}&interval=${interval}`;
     fetch(url)
       .then(async (r) => {
         const body = (await r.json()) as QuoteResponse | { error: string };
@@ -315,7 +384,7 @@ export default function PriceChart() {
     return () => {
       cancelled = true;
     };
-  }, [ticker, range]);
+  }, [ticker, timeframe, interval]);
 
   const data = quote?.points ?? [];
   const baseline = quote?.previousClose ?? data[0]?.price ?? 0;
@@ -364,15 +433,16 @@ export default function PriceChart() {
     }
     drawChart(canvasRef.current, {
       data,
-      range,
       hoverIdx,
       width: size.w,
       height: size.h,
       baseline,
+      period: timeframe.period,
+      interval,
+      display,
     });
-  }, [data, range, hoverIdx, size, baseline]);
+  }, [data, hoverIdx, size, baseline, timeframe, interval, display]);
 
-  /* mouse handling */
   const handlePointer = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>) => {
       const canvas = canvasRef.current;
@@ -380,7 +450,7 @@ export default function PriceChart() {
       const rect = canvas.getBoundingClientRect();
       const x = e.clientX - rect.left;
       const PAD_LEFT = 8;
-      const PAD_RIGHT = 76;
+      const PAD_RIGHT = 80;
       const plotW = rect.width - PAD_LEFT - PAD_RIGHT;
       if (plotW <= 0) return;
       const u = Math.max(0, Math.min(1, (x - PAD_LEFT) / plotW));
@@ -392,7 +462,6 @@ export default function PriceChart() {
 
   const handleLeave = useCallback(() => setHoverIdx(null), []);
 
-  /* ticker submit */
   const submitTicker = () => {
     const next = tickerInput
       .toUpperCase()
@@ -404,33 +473,14 @@ export default function PriceChart() {
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <div className="mx-auto max-w-[820px] px-6 py-12">
-        {/* Editable headline */}
-        <div className="text-center">
-          <textarea
-            value={headline}
-            onChange={(e) => setHeadline(e.target.value)}
-            spellCheck={false}
-            rows={3}
-            className="w-full resize-none border-none bg-transparent text-center text-[40px] leading-[1.05] tracking-tight text-foreground outline-none focus:bg-[hsl(0_0%_97%)] sm:text-[52px]"
-            style={{
-              fontFamily: 'Georgia, "Times New Roman", serif',
-              fontWeight: 500,
-            }}
-            aria-label="Editable headline"
-          />
-          <div className="mt-1 text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-            Click headline or ticker to edit · Real-time data via Yahoo Finance
-          </div>
-        </div>
-
-        {/* Card */}
-        <div
-          className="mt-8 rounded-[28px] p-6 sm:p-7"
-          style={{ backgroundColor: "hsl(0 0% 94%)" }}
-        >
-          <div className="flex items-start justify-between gap-4">
-            <div className="min-w-0">
+      <div className="mx-auto flex max-w-[1100px] gap-6 px-6 py-10">
+        {/* ============ Sidebar ============ */}
+        <aside className="w-[170px] shrink-0">
+          <div className="sticky top-6 space-y-5">
+            <div>
+              <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                Ticker
+              </div>
               <input
                 value={tickerInput}
                 onChange={(e) => setTickerInput(e.target.value.toUpperCase())}
@@ -442,107 +492,210 @@ export default function PriceChart() {
                   }
                 }}
                 spellCheck={false}
-                className="w-[140px] border-none bg-transparent text-[12px] font-semibold uppercase tracking-[0.18em] text-muted-foreground outline-none focus:text-foreground"
-                aria-label="Ticker symbol"
-                placeholder="TICKER"
+                className="w-full rounded-md border border-[hsl(0_0%_88%)] bg-white px-2.5 py-1.5 text-sm font-bold tracking-wide text-foreground outline-none focus:border-foreground"
+                placeholder="AAPL"
               />
-              <div className="mt-1 text-[34px] font-semibold tabular-nums tracking-tight text-foreground sm:text-[40px]">
-                {loading && !quote
-                  ? "—"
-                  : `${quote?.currency === "USD" || !quote?.currency ? "$" : ""}${fmtMoney(active.price)}`}
-              </div>
-              <div className="mt-1 flex flex-wrap items-center gap-2 text-[13px] sm:text-sm">
-                {error ? (
-                  <span className="font-semibold text-red-600">
-                    {error}
-                  </span>
-                ) : (
-                  <>
-                    <span
-                      className="font-semibold tabular-nums"
-                      style={{ color: lineColor }}
-                    >
-                      {change >= 0 ? "+" : "-"}
-                      {fmtMoney(Math.abs(change))} ({changePct >= 0 ? "+" : ""}
-                      {changePct.toFixed(2)}%)
-                    </span>
-                    <span className="text-muted-foreground">|</span>
-                    <span className="text-muted-foreground">
-                      {range}
-                      {loading ? " · loading…" : ""}
-                    </span>
-                  </>
-                )}
-              </div>
             </div>
 
-            {/* Logo tile */}
-            <div
-              className="flex h-[68px] w-[68px] shrink-0 items-center justify-center rounded-[18px] bg-white text-[18px] font-bold tracking-tight shadow-sm"
-              style={{ color: lineColor }}
-              aria-label={`${ticker} logo`}
-            >
-              {ticker.slice(0, 4)}
-            </div>
-          </div>
-
-          {/* Canvas chart */}
-          <div ref={wrapRef} className="relative mt-6 h-[320px] w-full">
-            <canvas
-              ref={canvasRef}
-              onPointerMove={handlePointer}
-              onPointerDown={handlePointer}
-              onPointerLeave={handleLeave}
-              className="block h-full w-full touch-none cursor-crosshair"
-            />
-            {loading && data.length === 0 && (
-              <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
-                Loading {ticker}…
-              </div>
-            )}
-            {error && data.length === 0 && (
-              <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-muted-foreground">
-                Couldn't load {ticker}. Try another symbol.
-              </div>
-            )}
-          </div>
-
-          {/* Range selector */}
-          <div className="mt-4 flex flex-wrap items-center gap-1">
-            {RANGES.map((r) => {
-              const isActive = r === range;
-              return (
-                <button
-                  key={r}
-                  type="button"
-                  onClick={() => setRange(r)}
-                  className="rounded-md px-3 py-1.5 text-xs font-semibold transition-colors"
-                  style={{
-                    color: isActive ? "#ffffff" : "hsl(0 0% 35%)",
-                    backgroundColor: isActive ? lineColor : "transparent",
-                  }}
+            <SidebarGroup label="Timeframe">
+              {TIMEFRAMES.map((tf) => (
+                <SidebarItem
+                  key={tf.key}
+                  active={tf.key === timeframeKey}
+                  onClick={() => setTimeframeKey(tf.key)}
+                  color={lineColor}
                 >
-                  {r}
-                </button>
-              );
-            })}
-            <div className="ml-auto text-xs tabular-nums text-muted-foreground">
-              {data.length > 0
-                ? new Date(active.t).toLocaleString("en-US", {
-                    month: "short",
-                    day: "numeric",
-                    hour:
-                      range === "1D" || range === "1W" ? "numeric" : undefined,
-                    minute:
-                      range === "1D" || range === "1W" ? "2-digit" : undefined,
-                    year:
-                      range === "1Y" || range === "5Y" ? "numeric" : undefined,
-                  })
-                : ""}
+                  {tf.label}
+                </SidebarItem>
+              ))}
+            </SidebarGroup>
+
+            <SidebarGroup label="Interval">
+              {timeframe.allowedIntervals.map((iv) => (
+                <SidebarItem
+                  key={iv}
+                  active={iv === interval}
+                  onClick={() => setIntervalState(iv)}
+                  color={lineColor}
+                >
+                  {INTERVAL_LABELS[iv] ?? iv}
+                </SidebarItem>
+              ))}
+            </SidebarGroup>
+
+            <SidebarGroup label="Display">
+              <SidebarItem
+                active={display === "price"}
+                onClick={() => setDisplay("price")}
+                color={lineColor}
+              >
+                Price
+              </SidebarItem>
+              <SidebarItem
+                active={display === "percent"}
+                onClick={() => setDisplay("percent")}
+                color={lineColor}
+              >
+                %
+              </SidebarItem>
+            </SidebarGroup>
+          </div>
+        </aside>
+
+        {/* ============ Main ============ */}
+        <main className="flex-1 min-w-0">
+          {/* Editable headline */}
+          <textarea
+            value={headline}
+            onChange={(e) => setHeadline(e.target.value)}
+            spellCheck={false}
+            rows={2}
+            className="w-full resize-none border-none bg-transparent text-center text-[34px] leading-[1.05] tracking-tight text-foreground outline-none focus:bg-[hsl(0_0%_97%)] sm:text-[44px]"
+            style={{ fontFamily: 'Georgia, "Times New Roman", serif', fontWeight: 500 }}
+            aria-label="Editable headline"
+          />
+          <div className="mt-1 text-center text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+            Real-time data via Yahoo Finance
+          </div>
+
+          {/* Card */}
+          <div
+            className="mt-6 rounded-[28px] p-6 sm:p-7"
+            style={{ backgroundColor: "hsl(0 0% 94%)" }}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <div className="text-[12px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                  {ticker}
+                </div>
+                <div className="mt-1 text-[34px] font-semibold tabular-nums tracking-tight text-foreground sm:text-[40px]">
+                  {loading && !quote
+                    ? "—"
+                    : `${quote?.currency === "USD" || !quote?.currency ? "$" : ""}${fmtMoney(active.price)}`}
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-2 text-[13px] sm:text-sm">
+                  {error ? (
+                    <span className="font-semibold text-red-600">{error}</span>
+                  ) : (
+                    <>
+                      <span
+                        className="font-semibold tabular-nums"
+                        style={{ color: lineColor }}
+                      >
+                        {change >= 0 ? "+" : "-"}
+                        {fmtMoney(Math.abs(change))} ({changePct >= 0 ? "+" : ""}
+                        {changePct.toFixed(2)}%)
+                      </span>
+                      <span className="text-muted-foreground">|</span>
+                      <span className="text-muted-foreground">
+                        {timeframe.label} · {INTERVAL_LABELS[interval] ?? interval}
+                        {loading ? " · loading…" : ""}
+                      </span>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div
+                className="flex h-[68px] w-[68px] shrink-0 items-center justify-center rounded-[18px] bg-white text-[18px] font-bold tracking-tight shadow-sm"
+                style={{ color: lineColor }}
+                aria-label={`${ticker} logo`}
+              >
+                {ticker.slice(0, 4)}
+              </div>
+            </div>
+
+            <div ref={wrapRef} className="relative mt-6 h-[340px] w-full">
+              <canvas
+                ref={canvasRef}
+                onPointerMove={handlePointer}
+                onPointerDown={handlePointer}
+                onPointerLeave={handleLeave}
+                className="block h-full w-full touch-none cursor-crosshair"
+              />
+              {loading && data.length === 0 && (
+                <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
+                  Loading {ticker}…
+                </div>
+              )}
+              {error && data.length === 0 && (
+                <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-muted-foreground">
+                  Couldn't load {ticker}. Try another symbol or timeframe.
+                </div>
+              )}
+            </div>
+
+            <div className="mt-3 flex items-center justify-between text-xs tabular-nums text-muted-foreground">
+              <span>
+                {quote ? `${quote.symbol} · ${quote.currency}` : ""}
+              </span>
+              <span>
+                {data.length > 0
+                  ? new Date(active.t).toLocaleString("en-US", {
+                      month: "short",
+                      day: "numeric",
+                      year: timeframe.period === "max" || timeframe.period === "5y" || timeframe.period === "1y"
+                        ? "numeric" : undefined,
+                      hour: ["1d", "5d"].includes(timeframe.period) ? "numeric" : undefined,
+                      minute: ["1d", "5d"].includes(timeframe.period) ? "2-digit" : undefined,
+                    })
+                  : ""}
+              </span>
             </div>
           </div>
-        </div>
+        </main>
       </div>
     </div>
+  );
+}
+
+/* ------------------------- sidebar subcomponents ------------------------- */
+
+function SidebarGroup({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+        {label}
+      </div>
+      <div className="flex flex-col gap-0.5">{children}</div>
+    </div>
+  );
+}
+
+function SidebarItem({
+  active,
+  onClick,
+  color,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  color: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="rounded-md px-2.5 py-1.5 text-left text-[13px] font-semibold transition-colors"
+      style={{
+        color: active ? "#ffffff" : "hsl(0 0% 30%)",
+        backgroundColor: active ? color : "transparent",
+      }}
+      onMouseEnter={(e) => {
+        if (!active) e.currentTarget.style.backgroundColor = "hsl(0 0% 92%)";
+      }}
+      onMouseLeave={(e) => {
+        if (!active) e.currentTarget.style.backgroundColor = "transparent";
+      }}
+    >
+      {children}
+    </button>
   );
 }
