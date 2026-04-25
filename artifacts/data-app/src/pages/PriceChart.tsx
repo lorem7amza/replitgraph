@@ -11,69 +11,15 @@ type Point = { t: number; price: number };
 type Range = "1D" | "1W" | "1M" | "3M" | "1Y" | "5Y";
 const RANGES: Range[] = ["1D", "1W", "1M", "3M", "1Y", "5Y"];
 
-/* --------------------------- data generation --------------------------- */
-
-function hashString(s: string): number {
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
-}
-
-function seedRandom(seed: number) {
-  let s = seed >>> 0 || 1;
-  return () => {
-    s = (s * 1664525 + 1013904223) >>> 0;
-    return s / 0xffffffff;
-  };
-}
-
-interface RangeCfg {
-  points: number;
-  stepMs: number;
-  vol: number;
-  drift: number;
-}
-
-const RANGE_CFG: Record<Range, RangeCfg> = {
-  "1D": { points: 78, stepMs: 5 * 60_000, vol: 0.0018, drift: 0.00005 },
-  "1W": { points: 5 * 78, stepMs: 5 * 60_000, vol: 0.0022, drift: 0.00006 },
-  "1M": { points: 22, stepMs: 24 * 3600_000, vol: 0.014, drift: 0.0009 },
-  "3M": { points: 65, stepMs: 24 * 3600_000, vol: 0.016, drift: 0.0011 },
-  "1Y": { points: 252, stepMs: 24 * 3600_000, vol: 0.018, drift: 0.0008 },
-  "5Y": { points: 260, stepMs: 7 * 24 * 3600_000, vol: 0.03, drift: 0.0025 },
-};
-
-function generateSeries(ticker: string, range: Range): Point[] {
-  const cfg = RANGE_CFG[range];
-  const seed = hashString(`${ticker}|${range}`);
-  const rand = seedRandom(seed);
-
-  // Anchor a deterministic "current" price per ticker.
-  const anchor = 30 + (hashString(ticker) % 400);
-
-  // Choose a directional bias also derived from the ticker so different
-  // tickers feel different (some up, some down, some flat).
-  const biasRand = seedRandom(hashString(ticker + "_bias"));
-  const directional = (biasRand() - 0.5) * 2 * cfg.drift;
-
-  let price = anchor * (0.85 + 0.3 * biasRand());
-
-  const series: Point[] = [];
-  const now = Date.now();
-  const start = now - cfg.points * cfg.stepMs;
-  for (let i = 0; i < cfg.points; i++) {
-    const z = (rand() + rand() + rand() - 1.5) * 1.4;
-    price = price * (1 + directional + cfg.vol * z);
-    series.push({ t: start + i * cfg.stepMs, price });
-  }
-  // Anchor end to the deterministic current price.
-  const last = series[series.length - 1]!;
-  const scale = anchor / last.price;
-  for (const p of series) p.price = +(p.price * scale).toFixed(4);
-  return series;
+interface QuoteResponse {
+  symbol: string;
+  name: string;
+  currency: string;
+  range: Range;
+  interval: string;
+  last: number;
+  previousClose: number;
+  points: Point[];
 }
 
 /* ------------------------------ formatters ------------------------------ */
@@ -113,6 +59,7 @@ interface DrawArgs {
   hoverIdx: number | null;
   width: number;
   height: number;
+  baseline: number; // open / previous close used for % computation
 }
 
 function roundRectPath(
@@ -137,7 +84,7 @@ function roundRectPath(
 }
 
 function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
-  const { data, range, hoverIdx, width, height } = args;
+  const { data, range, hoverIdx, width, height, baseline } = args;
   if (!canvas || data.length === 0 || width === 0 || height === 0) return;
 
   const dpr = Math.max(1, window.devicePixelRatio || 1);
@@ -160,9 +107,8 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   const plotH = height - PAD.top - PAD.bottom;
   if (plotW <= 0 || plotH <= 0) return;
 
-  const open = data[0]!.price;
   const last = data[data.length - 1]!.price;
-  const isUp = last >= open;
+  const isUp = last >= baseline;
   const upColor = "#1f9d55";
   const downColor = "#e8501f";
   const lineColor = isUp ? upColor : downColor;
@@ -178,8 +124,8 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
     if (p.price > maxP) maxP = p.price;
   }
   const span = maxP - minP || 1;
-  const yMin = Math.min(open, minP) - span * 0.08;
-  const yMax = Math.max(open, maxP) + span * 0.08;
+  const yMin = Math.min(baseline, minP) - span * 0.08;
+  const yMax = Math.max(baseline, maxP) + span * 0.08;
 
   const tMin = data[0]!.t;
   const tMax = data[data.length - 1]!.t;
@@ -189,17 +135,16 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   const yPos = (price: number) =>
     PAD.top + (1 - (price - yMin) / (yMax - yMin)) * plotH;
 
-  // Right axis percentage ticks.
-  const pcts = [-40, -20, 0, 20, 40, 60, 80, 100];
+  // Right axis percentage ticks (relative to baseline).
+  const candidatePcts = [-40, -20, -10, 0, 10, 20, 40, 60, 80, 100];
   ctx.fillStyle = "#5a5a5a";
   ctx.font = "11px Inter, ui-sans-serif, system-ui, sans-serif";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
-  for (const p of pcts) {
-    const price = open * (1 + p / 100);
+  for (const p of candidatePcts) {
+    const price = baseline * (1 + p / 100);
     if (price < yMin || price > yMax) continue;
     const y = yPos(price);
-    // Faint grid line (only at 0).
     if (p === 0) {
       ctx.strokeStyle = "#bdbdbd";
       ctx.lineWidth = 1;
@@ -264,7 +209,7 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   ctx.lineCap = "round";
   ctx.stroke(linePath);
 
-  // Active point (hover or last).
+  // Active point.
   const activeIdx =
     hoverIdx !== null && hoverIdx >= 0 && hoverIdx < data.length
       ? hoverIdx
@@ -273,7 +218,6 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   const ax = xPos(active.t);
   const ay = yPos(active.price);
 
-  // Crosshair (only when hovering).
   if (hoverIdx !== null) {
     ctx.strokeStyle = "#9a9a9a";
     ctx.setLineDash([2, 3]);
@@ -285,7 +229,6 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
     ctx.setLineDash([]);
   }
 
-  // Horizontal callout line at active price.
   ctx.strokeStyle = lineColor;
   ctx.setLineDash([3, 3]);
   ctx.lineWidth = 1;
@@ -295,7 +238,6 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // Active dot.
   ctx.beginPath();
   ctx.fillStyle = "#ffffff";
   ctx.strokeStyle = lineColor;
@@ -304,8 +246,7 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
   ctx.fill();
   ctx.stroke();
 
-  // Callout tag.
-  const pct = ((active.price - open) / open) * 100;
+  const pct = ((active.price - baseline) / baseline) * 100;
   const tagW = 70;
   const tagH = 22;
   const tagX = PAD.left + plotW + 6;
@@ -330,7 +271,10 @@ function drawChart(canvas: HTMLCanvasElement, args: DrawArgs) {
 
 /* -------------------------------- page -------------------------------- */
 
+const apiBase = `${import.meta.env.BASE_URL.replace(/\/$/, "")}/api` || "/api";
+
 export default function PriceChart() {
+  const [tickerInput, setTickerInput] = useState("AAPL");
   const [ticker, setTicker] = useState("AAPL");
   const [headline, setHeadline] = useState(
     "Apple Stock Climbs After Strong Quarter",
@@ -338,19 +282,56 @@ export default function PriceChart() {
   const [range, setRange] = useState<Range>("3M");
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
-  const data = useMemo(() => generateSeries(ticker, range), [ticker, range]);
-  const open = data[0]!.price;
-  const last = data[data.length - 1]!.price;
+  const [quote, setQuote] = useState<QuoteResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Fetch from Yahoo Finance via the API server.
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setHoverIdx(null);
+    const url = `${apiBase}/quote?ticker=${encodeURIComponent(
+      ticker,
+    )}&range=${range}`;
+    fetch(url)
+      .then(async (r) => {
+        const body = (await r.json()) as QuoteResponse | { error: string };
+        if (!r.ok || "error" in body) {
+          throw new Error(("error" in body && body.error) || `HTTP ${r.status}`);
+        }
+        if (cancelled) return;
+        setQuote(body);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : String(err));
+        setQuote(null);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ticker, range]);
+
+  const data = quote?.points ?? [];
+  const baseline = quote?.previousClose ?? data[0]?.price ?? 0;
+  const last = quote?.last ?? data[data.length - 1]?.price ?? 0;
+
   const active =
     hoverIdx !== null && hoverIdx >= 0 && hoverIdx < data.length
       ? data[hoverIdx]!
-      : data[data.length - 1]!;
-  const change = active.price - open;
-  const changePct = (change / open) * 100;
-  const isUp = last >= open;
+      : (data[data.length - 1] ?? { t: Date.now(), price: last });
+
+  const change = active.price - baseline;
+  const changePct = baseline === 0 ? 0 : (change / baseline) * 100;
+  const isUp = last >= baseline;
   const lineColor = isUp ? "#1f9d55" : "#e8501f";
 
-  /* canvas + resize */
+  /* canvas sizing */
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [size, setSize] = useState({ w: 0, h: 320 });
@@ -370,20 +351,32 @@ export default function PriceChart() {
 
   useEffect(() => {
     if (!canvasRef.current) return;
+    if (data.length === 0) {
+      const ctx = canvasRef.current.getContext("2d");
+      if (ctx) {
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        canvasRef.current.width = Math.round(size.w * dpr);
+        canvasRef.current.height = Math.round(size.h * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, size.w, size.h);
+      }
+      return;
+    }
     drawChart(canvasRef.current, {
       data,
       range,
       hoverIdx,
       width: size.w,
       height: size.h,
+      baseline,
     });
-  }, [data, range, hoverIdx, size]);
+  }, [data, range, hoverIdx, size, baseline]);
 
   /* mouse handling */
   const handlePointer = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>) => {
       const canvas = canvasRef.current;
-      if (!canvas) return;
+      if (!canvas || data.length === 0) return;
       const rect = canvas.getBoundingClientRect();
       const x = e.clientX - rect.left;
       const PAD_LEFT = 8;
@@ -399,13 +392,14 @@ export default function PriceChart() {
 
   const handleLeave = useCallback(() => setHoverIdx(null), []);
 
-  /* ticker input */
-  const handleTickerChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const next = e.target.value
+  /* ticker submit */
+  const submitTicker = () => {
+    const next = tickerInput
       .toUpperCase()
-      .replace(/[^A-Z.\-]/g, "")
-      .slice(0, 6);
-    setTicker(next || "AAPL");
+      .replace(/[^A-Z0-9.\-^=]/g, "")
+      .slice(0, 10);
+    if (next && next !== ticker) setTicker(next);
+    else if (!next) setTickerInput(ticker);
   };
 
   return (
@@ -426,7 +420,7 @@ export default function PriceChart() {
             aria-label="Editable headline"
           />
           <div className="mt-1 text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-            Click headline or ticker to edit
+            Click headline or ticker to edit · Real-time data via Yahoo Finance
           </div>
         </div>
 
@@ -437,34 +431,54 @@ export default function PriceChart() {
         >
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
-              {/* Ticker input */}
               <input
-                value={ticker}
-                onChange={handleTickerChange}
+                value={tickerInput}
+                onChange={(e) => setTickerInput(e.target.value.toUpperCase())}
+                onBlur={submitTicker}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    (e.currentTarget as HTMLInputElement).blur();
+                  }
+                }}
                 spellCheck={false}
-                className="w-[110px] border-none bg-transparent text-[12px] font-semibold uppercase tracking-[0.18em] text-muted-foreground outline-none focus:text-foreground"
+                className="w-[140px] border-none bg-transparent text-[12px] font-semibold uppercase tracking-[0.18em] text-muted-foreground outline-none focus:text-foreground"
                 aria-label="Ticker symbol"
+                placeholder="TICKER"
               />
               <div className="mt-1 text-[34px] font-semibold tabular-nums tracking-tight text-foreground sm:text-[40px]">
-                ${fmtMoney(active.price)}
+                {loading && !quote
+                  ? "—"
+                  : `${quote?.currency === "USD" || !quote?.currency ? "$" : ""}${fmtMoney(active.price)}`}
               </div>
               <div className="mt-1 flex flex-wrap items-center gap-2 text-[13px] sm:text-sm">
-                <span
-                  className="font-semibold tabular-nums"
-                  style={{ color: lineColor }}
-                >
-                  {change >= 0 ? "+" : "-"}
-                  {fmtMoney(Math.abs(change))} ({changePct >= 0 ? "+" : ""}
-                  {changePct.toFixed(2)}%)
-                </span>
-                <span className="text-muted-foreground">|</span>
-                <span className="text-muted-foreground">{range}</span>
+                {error ? (
+                  <span className="font-semibold text-red-600">
+                    {error}
+                  </span>
+                ) : (
+                  <>
+                    <span
+                      className="font-semibold tabular-nums"
+                      style={{ color: lineColor }}
+                    >
+                      {change >= 0 ? "+" : "-"}
+                      {fmtMoney(Math.abs(change))} ({changePct >= 0 ? "+" : ""}
+                      {changePct.toFixed(2)}%)
+                    </span>
+                    <span className="text-muted-foreground">|</span>
+                    <span className="text-muted-foreground">
+                      {range}
+                      {loading ? " · loading…" : ""}
+                    </span>
+                  </>
+                )}
               </div>
             </div>
 
             {/* Logo tile */}
             <div
-              className="flex h-[68px] w-[68px] shrink-0 items-center justify-center rounded-[18px] bg-white text-[20px] font-bold tracking-tight shadow-sm"
+              className="flex h-[68px] w-[68px] shrink-0 items-center justify-center rounded-[18px] bg-white text-[18px] font-bold tracking-tight shadow-sm"
               style={{ color: lineColor }}
               aria-label={`${ticker} logo`}
             >
@@ -481,6 +495,16 @@ export default function PriceChart() {
               onPointerLeave={handleLeave}
               className="block h-full w-full touch-none cursor-crosshair"
             />
+            {loading && data.length === 0 && (
+              <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
+                Loading {ticker}…
+              </div>
+            )}
+            {error && data.length === 0 && (
+              <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-muted-foreground">
+                Couldn't load {ticker}. Try another symbol.
+              </div>
+            )}
           </div>
 
           {/* Range selector */}
@@ -491,10 +515,7 @@ export default function PriceChart() {
                 <button
                   key={r}
                   type="button"
-                  onClick={() => {
-                    setRange(r);
-                    setHoverIdx(null);
-                  }}
+                  onClick={() => setRange(r)}
                   className="rounded-md px-3 py-1.5 text-xs font-semibold transition-colors"
                   style={{
                     color: isActive ? "#ffffff" : "hsl(0 0% 35%)",
@@ -506,16 +527,18 @@ export default function PriceChart() {
               );
             })}
             <div className="ml-auto text-xs tabular-nums text-muted-foreground">
-              {new Date(active.t).toLocaleString("en-US", {
-                month: "short",
-                day: "numeric",
-                hour:
-                  range === "1D" || range === "1W" ? "numeric" : undefined,
-                minute:
-                  range === "1D" || range === "1W" ? "2-digit" : undefined,
-                year:
-                  range === "1Y" || range === "5Y" ? "numeric" : undefined,
-              })}
+              {data.length > 0
+                ? new Date(active.t).toLocaleString("en-US", {
+                    month: "short",
+                    day: "numeric",
+                    hour:
+                      range === "1D" || range === "1W" ? "numeric" : undefined,
+                    minute:
+                      range === "1D" || range === "1W" ? "2-digit" : undefined,
+                    year:
+                      range === "1Y" || range === "5Y" ? "numeric" : undefined,
+                  })
+                : ""}
             </div>
           </div>
         </div>
