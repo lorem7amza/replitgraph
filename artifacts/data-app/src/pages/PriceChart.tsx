@@ -536,10 +536,6 @@ export default function PriceChart() {
             style={{ fontFamily: 'Georgia, "Times New Roman", serif', fontWeight: 500 }}
             aria-label="Editable headline"
           />
-          <div className="mt-1 text-center text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-            Real-time data via Yahoo Finance
-          </div>
-
           {/* Card */}
           <div
             className="mt-6 rounded-[28px] p-6 sm:p-7"
